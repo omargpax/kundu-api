@@ -6,6 +6,7 @@ REST API robusta construida con **Spring Boot**, **Spring Security** y **JPA/Hib
 
 El backend cuenta con arquitectura limpia, servicios bidireccionales en tiempo real y automatización de tareas por lotes, optimizado para soportar una carga estimada de **1000 a 1500 usuarios**.
 
+> More details: [Deepwiki view](https://deepwiki.com/omargpax/kundu-api)
 ---
 
 ## 📋 Documentación Adicional (Docs)
