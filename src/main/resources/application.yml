@@ -1,35 +1,486 @@
+# ============================================================
+#  KUNDU-API — application.yml
+#  Versión: 2025-2026  |  Spring Boot 3.x  |  Java 21+
+#  Best Practices: HikariCP, JPA, Security, Actuator, Redis
+#
+#  🔐 Variables de entorno requeridas (.env o secret manager):
+#     Nunca hardcodear credenciales en este archivo.
+#     Usar: Vault, AWS Secrets Manager, o .env local.
+# ============================================================
+
+# ─────────────────────────────────────────────
+#  PERFIL ACTIVO
+# ─────────────────────────────────────────────
 spring:
-  data:
-    redis:
-      repositories:
-        enabled: false
+  profiles:
+    active: ${SPRING_PROFILE:dev}   # dev | prod | staging
+
+# ─────────────────────────────────────────────
+#  INFORMACIÓN DE LA APLICACIÓN
+# ─────────────────────────────────────────────
+  application:
+    name: kundu-api
+    version: ${APP_VERSION:1.0.0}
+
+# ─────────────────────────────────────────────
+#  BASE DE DATOS — MySQL 8.x
+# ─────────────────────────────────────────────
   datasource:
-    url: jdbc:mysql://localhost:3306/dbo_kundu
-    username: kundu
-    password: 12345
+    url: >-
+      jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:kundu_db}
+      ?useSSL=${DB_USE_SSL:true}
+      &requireSSL=${DB_REQUIRE_SSL:true}
+      &serverTimezone=America/Lima
+      &characterEncoding=UTF-8
+      &useUnicode=true
+      &rewriteBatchedStatements=true
+      &cachePrepStmts=true
+      &prepStmtCacheSize=250
+      &prepStmtCacheSqlLimit=2048
+      &useServerPrepStmts=true
+      &useLocalSessionState=true
+      &cacheResultSetMetadata=true
+      &cacheServerConfiguration=true
+      &elideSetAutoCommits=true
+      &maintainTimeStats=false
+      &allowPublicKeyRetrieval=${DB_ALLOW_PUBLIC_KEY:false}
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
     driver-class-name: com.mysql.cj.jdbc.Driver
+
+    # ── HikariCP — Optimizado para 1000-1500 usuarios concurrentes ──────────
+    hikari:
+      pool-name: KunduHikariPool
+
+      # Tamaño del pool: fórmula = (núcleos_CPU × 2) + discos_efectivos
+      # Para servidor de 8 núcleos apuntando a 1500 usuarios: ~50-60 conexiones
+      minimum-idle: 15
+      maximum-pool-size: 60
+
+      # Tiempos (en milisegundos)
+      connection-timeout: 5000          # 5s máx para obtener conexión del pool
+      idle-timeout: 300000              # 5 min: cierra conexiones idle extras
+      max-lifetime: 1800000             # 30 min: rota conexiones (< wait_timeout MySQL)
+      keepalive-time: 60000             # Ping cada 60s para mantener viva la conexión
+      validation-timeout: 3000          # 3s para validar que la conexión es usable
+      leak-detection-threshold: 10000   # Alerta si una conexión no se libera en 10s
+
+      # Query de validación para MySQL
+      connection-test-query: SELECT 1
+
+      # Propiedades nativas del driver MySQL
+      data-source-properties:
+        cachePrepStmts: true
+        prepStmtCacheSize: 250
+        prepStmtCacheSqlLimit: 2048
+        useServerPrepStmts: true
+        useLocalSessionState: true
+        rewriteBatchedStatements: true
+        cacheResultSetMetadata: true
+        cacheServerConfiguration: true
+        elideSetAutoCommits: true
+        maintainTimeStats: false
+
+# ─────────────────────────────────────────────
+#  JPA / HIBERNATE
+# ─────────────────────────────────────────────
   jpa:
-    open-in-view: false
+    open-in-view: false                 # ⚠️ CRÍTICO: Desactivar para evitar lazy loads fuera de transacción
+    show-sql: ${JPA_SHOW_SQL:false}     # Solo true en dev, nunca en prod
     hibernate:
-      ddl-auto: none
-    show-sql: false
+      ddl-auto: ${JPA_DDL_AUTO:validate} # validate en prod | update solo en dev local
     properties:
       hibernate:
         dialect: org.hibernate.dialect.MySQLDialect
-        format_sql: true
-      database: mysql
-  cache:
-    type: redis
-  redis:
-    host: localhost
-    port: 6379
-application:
-  security:
-    jwt:
-      secret-key: 8b984dbbe702342367c0113e0286778633de0e99ee3e4e6457e1e18f03aeb9d0
-      expiration: 86400000 # a day
-      refresh-token:
-        expiration: 604800000 # 7 days
+        format_sql: false
 
+        # ── Optimización de Batch ───────────────────────────────────────────
+        jdbc:
+          batch_size: 50
+          fetch_size: 100
+          batch_versioned_data: true
+        order_inserts: true             # Agrupa INSERTs del mismo tipo para batch
+        order_updates: true             # Agrupa UPDATEs para batch eficiente
+
+        # ── Optimización de Queries ─────────────────────────────────────────
+        query:
+          in_clause_parameter_padding: true   # Mejora hit-rate del query plan cache
+          fail_on_pagination_over_collection_fetch: true  # Detecta paginación con N+1
+
+        # ── Gestión de Conexiones (libera antes en read-only) ───────────────
+        connection:
+          handling_mode: DELAYED_ACQUISITION_AND_RELEASE
+
+        # ── Estadísticas (activar solo en dev/staging para profiling) ───────
+        generate_statistics: ${HIBERNATE_STATS:false}
+
+        # ── Cache de Segundo Nivel (opcional con Redis/Ehcache) ─────────────
+        cache:
+          use_second_level_cache: false
+          use_query_cache: false
+
+# ─────────────────────────────────────────────
+#  REDIS — Cache L2 + SocketIO State + Sessions
+# ─────────────────────────────────────────────
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      ssl:
+        enabled: ${REDIS_SSL:false}
+      timeout: 2000ms
+      database: ${REDIS_DB:0}
+
+      # ── Lettuce Pool (recomendado sobre Jedis en Spring Boot 3.x) ──────────
+      lettuce:
+        pool:
+          max-active: 20
+          max-idle: 10
+          min-idle: 5
+          max-wait: 1000ms
+        shutdown-timeout: 200ms
+
+  # ── Configuración de Caché Spring ──────────────────────────────────────────
+  cache:
+    type: ${CACHE_TYPE:redis}           # redis en prod | caffeine en dev
+    redis:
+      time-to-live: 1800000             # 30 minutos (ms)
+      cache-null-values: false
+      use-key-prefix: true
+      key-prefix: "kundu:cache:"
+      enable-statistics: true
+
+# ─────────────────────────────────────────────
+#  SEGURIDAD — Spring Security / OAuth2 / JWT
+# ─────────────────────────────────────────────
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: ${JWT_ISSUER_URI}
+          jwk-set-uri: ${JWT_JWK_SET_URI:}     # Opcional si usas JWKS externo
+
+# ─────────────────────────────────────────────
+#  JWT — Configuración Propia (si no usas OAuth2 externo)
+# ─────────────────────────────────────────────
+jwt:
+  secret: ${JWT_SECRET}                 # Mínimo 512 bits (64 chars) para HS512
+  expiration-ms: ${JWT_EXPIRATION_MS:900000}          # 15 minutos access token
+  refresh-expiration-ms: ${JWT_REFRESH_EXPIRATION_MS:604800000}  # 7 días refresh token
+  issuer: ${JWT_ISSUER:kundu-api}
+
+# ─────────────────────────────────────────────
+#  NETTY-SOCKETIO — WebSocket Server
+# ─────────────────────────────────────────────
+socketio:
+  host: ${SOCKETIO_HOST:0.0.0.0}
+  port: ${SOCKETIO_PORT:9092}
+
+  # ── Tuning para 1500 conexiones concurrentes ────────────────────────────
+  worker-count: ${SOCKETIO_WORKERS:8}           # Threads Netty worker (≥ núcleos CPU)
+  boss-count: ${SOCKETIO_BOSS:2}                # Threads Netty acceptor
+
+  # Timeouts de conexión
+  ping-interval: 25000                          # ms entre pings del servidor
+  ping-timeout: 60000                           # ms sin pong → desconexión
+  upgrade-timeout: 10000                        # ms para upgrade HTTP→WS
+  first-data-timeout: 5000                      # ms para primer paquete
+
+  # Tamaño máximo de paquetes (bytes)
+  max-frame-payload-length: 1048576             # 1 MB
+  max-http-content-length: 1048576              # 1 MB
+
+  # ── Autenticación del Handshake ─────────────────────────────────────────
+  auth:
+    enabled: true
+    token-param: ${SOCKETIO_TOKEN_PARAM:token}  # Query param con JWT
+
+  # ── CORS para WebSocket ─────────────────────────────────────────────────
+  cors:
+    origin: ${CORS_ALLOWED_ORIGINS:http://localhost:3000}
+
+# ─────────────────────────────────────────────
+#  SERVIDOR HTTP — Tomcat Embedded
+# ─────────────────────────────────────────────
 server:
-  port: 8080
+  port: ${SERVER_PORT:8080}
+  servlet:
+    context-path: /api
+
+  # ── Tuning Tomcat para alta concurrencia ────────────────────────────────
+  tomcat:
+    threads:
+      max: ${TOMCAT_MAX_THREADS:300}            # Threads HTTP máximos
+      min-spare: ${TOMCAT_MIN_THREADS:30}       # Threads mínimos en idle
+    max-connections: 8192                       # Conexiones TCP abiertas máximas
+    accept-count: 200                           # Cola cuando todos los threads ocupados
+    connection-timeout: 20000                   # 20s timeout de conexión HTTP
+    keep-alive-timeout: 30000                   # 30s keepalive
+    max-keep-alive-requests: 100
+
+  # ── Compresión de Respuestas ────────────────────────────────────────────
+  compression:
+    enabled: true
+    mime-types: application/json,application/xml,text/html,text/plain
+    min-response-size: 1024                     # Solo comprime respuestas > 1KB
+
+  # ── Headers de Seguridad HTTP ───────────────────────────────────────────
+  http2:
+    enabled: true
+
+  error:
+    include-message: never                      # 🔐 NO exponer mensaje de error en prod
+    include-stacktrace: never                   # 🔐 NO exponer stack trace
+    include-binding-errors: never
+    include-exception: false                    # 🔐 NO exponer tipo de excepción
+    whitelabel:
+      enabled: false                            # Página de error personalizada
+
+  # ── SSL/TLS (si terminas SSL en la app, no en Nginx) ───────────────────
+  ssl:
+    enabled: ${SSL_ENABLED:false}
+    key-store: ${SSL_KEYSTORE_PATH:}
+    key-store-password: ${SSL_KEYSTORE_PASSWORD:}
+    key-store-type: ${SSL_KEYSTORE_TYPE:PKCS12}
+    protocol: TLS
+    enabled-protocols: TLSv1.2,TLSv1.3
+
+# ─────────────────────────────────────────────
+#  SCHEDULER — Tareas Programadas (Cron)
+# ─────────────────────────────────────────────
+scheduler:
+  # Pool de threads dedicado (aislado de Tomcat HTTP threads)
+  pool-size: ${SCHEDULER_POOL_SIZE:5}
+  thread-prefix: kundu-scheduler-
+  await-termination-seconds: 120
+  wait-for-tasks-on-shutdown: true
+
+  # Zonas horarias explícitas por tarea crítica
+  timezone: ${SCHEDULER_TIMEZONE:America/Lima}
+
+  # Crons configurables por variable de entorno
+  cron:
+    weekly-phase-update: ${CRON_WEEKLY_PHASE:0 0 1 * * MON}         # Lunes 1 AM
+    close-expired-sessions: ${CRON_CLOSE_SESSIONS:0 0/30 * * * *}   # Cada 30 min
+    league-ranking-update: ${CRON_LEAGUE_RANKING:0 30 0 * * MON}    # Lunes 12:30 AM
+
+# ─────────────────────────────────────────────
+#  ACTUATOR — Observabilidad y Health Checks
+# ─────────────────────────────────────────────
+management:
+  server:
+    port: ${ACTUATOR_PORT:8081}         # Puerto separado del tráfico de negocio
+    base-path: /
+
+  endpoints:
+    web:
+      base-path: /actuator
+      exposure:
+        include:
+          - health
+          - info
+          - metrics
+          - prometheus
+          - loggers
+          - caches
+          - hikaricp           # Pool de conexiones DB
+          - scheduledtasks     # Estado de crons
+
+  endpoint:
+    health:
+      show-details: ${ACTUATOR_HEALTH_DETAILS:when-authorized}  # Oculto en prod sin auth
+      show-components: when-authorized
+      probes:
+        enabled: true           # /actuator/health/liveness y /readiness para K8s
+    caches:
+      enabled: true
+    info:
+      enabled: true
+
+  health:
+    db:
+      enabled: true
+    redis:
+      enabled: true
+    diskspace:
+      enabled: true
+      threshold: 1GB
+
+  # ── Métricas Micrometer → Prometheus ────────────────────────────────────
+  metrics:
+    export:
+      prometheus:
+        enabled: ${PROMETHEUS_ENABLED:false}
+    tags:
+      application: ${spring.application.name}
+      environment: ${SPRING_PROFILE:dev}
+      version: ${APP_VERSION:1.0.0}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true      # Histograma completo de latencia HTTP
+      percentiles:
+        http.server.requests: 0.5,0.90,0.95,0.99
+      slo:
+        http.server.requests: 50ms,200ms,500ms,1s,2s  # SLOs de latencia
+
+  # ── Tracing Distribuido (OpenTelemetry / Zipkin) ─────────────────────────
+  tracing:
+    enabled: ${TRACING_ENABLED:false}
+    sampling:
+      probability: ${TRACING_SAMPLE_RATE:0.1}   # 10% de requests en prod
+
+  # ── Info del Build ────────────────────────────────────────────────────────
+  info:
+    env:
+      enabled: true
+    build:
+      enabled: true
+    git:
+      enabled: true
+      mode: simple
+
+# ─────────────────────────────────────────────
+#  LOGGING — Structured Logging (JSON en prod)
+# ─────────────────────────────────────────────
+logging:
+  level:
+    root: ${LOG_LEVEL_ROOT:INFO}
+    com.kundu: ${LOG_LEVEL_APP:INFO}                    # Tu paquete base
+    org.hibernate.SQL: ${LOG_LEVEL_SQL:WARN}            # WARN en prod, DEBUG en dev
+    org.hibernate.type.descriptor.sql: WARN
+    org.springframework.security: ${LOG_LEVEL_SEC:WARN}
+    org.springframework.web: WARN
+    com.zaxxer.hikari: ${LOG_LEVEL_HIKARI:WARN}
+    io.netty: WARN
+    com.corundumstudio.socketio: ${LOG_LEVEL_SOCKET:WARN}
+
+  # ── Formato Estructurado JSON (para ELK/CloudWatch) ────────────────────
+  structured:
+    format:
+      console: ${LOG_FORMAT:text}       # json en prod, text en dev
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level [%X{traceId}/%X{spanId}] %logger{36} - %msg%n"
+
+  file:
+    name: ${LOG_FILE_PATH:./logs/kundu-api.log}
+    max-size: 100MB
+    max-history: 30
+    total-size-cap: 2GB
+
+# ─────────────────────────────────────────────
+#  CORS — Cross-Origin Resource Sharing
+# ─────────────────────────────────────────────
+cors:
+  allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:3000,http://localhost:5173}
+  allowed-methods: GET,POST,PUT,PATCH,DELETE,OPTIONS
+  allowed-headers: Authorization,Content-Type,X-Requested-With,Accept,Origin,X-Correlation-Id
+  exposed-headers: X-Total-Count,X-Correlation-Id,Link
+  allow-credentials: true
+  max-age: 3600                         # Cache de preflight 1 hora
+
+# ─────────────────────────────────────────────
+#  ASYNC — Pool de Threads para @Async
+# ─────────────────────────────────────────────
+async:
+  executor:
+    core-pool-size: ${ASYNC_CORE_POOL:10}
+    max-pool-size: ${ASYNC_MAX_POOL:30}
+    queue-capacity: ${ASYNC_QUEUE:100}
+    thread-prefix: kundu-async-
+    keep-alive-seconds: 60
+
+# ─────────────────────────────────────────────
+#  MULTIPART — Subida de Archivos
+# ─────────────────────────────────────────────
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: ${MAX_FILE_SIZE:10MB}
+      max-request-size: ${MAX_REQUEST_SIZE:15MB}
+      file-size-threshold: 2KB
+
+# ─────────────────────────────────────────────
+#  JACKSON — Serialización JSON
+# ─────────────────────────────────────────────
+  jackson:
+    default-property-inclusion: NON_NULL        # No serializa campos null → respuestas limpias
+    serialization:
+      write-dates-as-timestamps: false          # ISO-8601 en lugar de timestamp numérico
+      fail-on-empty-beans: false
+    deserialization:
+      fail-on-unknown-properties: false         # Tolerante a campos extra del cliente
+    time-zone: ${JACKSON_TIMEZONE:America/Lima}
+    date-format: yyyy-MM-dd'T'HH:mm:ss.SSSZ
+
+# ─────────────────────────────────────────────
+#  VIRTUALTHREADS — Java 21+ Project Loom
+# ─────────────────────────────────────────────
+  threads:
+    virtual:
+      enabled: ${VIRTUAL_THREADS:true}         # Habilita Virtual Threads en Java 21+
+                                               # Reemplaza pool de Tomcat con hilos virtuales
+                                               # Mejora throughput en workloads I/O-bound
+
+# ─────────────────────────────────────────────
+#  NOTIFICACIONES / MAIL (si aplica)
+# ─────────────────────────────────────────────
+  mail:
+    host: ${MAIL_HOST:smtp.gmail.com}
+    port: ${MAIL_PORT:587}
+    username: ${MAIL_USER:}
+    password: ${MAIL_PASSWORD:}
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+            required: true
+          connectiontimeout: 5000
+          timeout: 5000
+          writetimeout: 5000
+
+# ─────────────────────────────────────────────
+#  VARIABLES DE ENTORNO REQUERIDAS (referencia)
+# ─────────────────────────────────────────────
+# Bloque solo documentativo — NO tiene efecto en runtime.
+# Crear un archivo .env local o configurar en el servidor/CI.
+#
+# ┌─────────────────────────────┬──────────────────────────────────────────┐
+# │ Variable                    │ Descripción                              │
+# ├─────────────────────────────┼──────────────────────────────────────────┤
+# │ SPRING_PROFILE              │ dev | staging | prod                     │
+# │ SERVER_PORT                 │ Puerto HTTP de la aplicación (ej: 8080)  │
+# │                             │                                          │
+# │ DB_HOST                     │ Host de MySQL (ej: db.kundu.internal)    │
+# │ DB_PORT                     │ Puerto MySQL (default: 3306)             │
+# │ DB_NAME                     │ Nombre de la base de datos               │
+# │ DB_USER                     │ Usuario de la base de datos              │
+# │ DB_PASSWORD                 │ Contraseña de la base de datos           │
+# │ DB_USE_SSL                  │ true en prod, false en dev local         │
+# │                             │                                          │
+# │ REDIS_HOST                  │ Host del servidor Redis                  │
+# │ REDIS_PORT                  │ Puerto Redis (default: 6379)             │
+# │ REDIS_PASSWORD              │ Contraseña Redis (vacío si sin auth)     │
+# │                             │                                          │
+# │ JWT_SECRET                  │ Clave secreta HS512 (mín. 64 caracteres) │
+# │ JWT_ISSUER_URI              │ URI del emisor JWT (ej: https://...)     │
+# │ JWT_EXPIRATION_MS           │ Expiración access token (ms)             │
+# │ JWT_REFRESH_EXPIRATION_MS   │ Expiración refresh token (ms)            │
+# │                             │                                          │
+# │ SOCKETIO_PORT               │ Puerto Netty-SocketIO (ej: 9092)        │
+# │ CORS_ALLOWED_ORIGINS        │ Orígenes permitidos separados por coma   │
+# │                             │                                          │
+# │ LOG_LEVEL_ROOT              │ Nivel raíz de logs (INFO | WARN | ERROR) │
+# │ LOG_LEVEL_APP               │ Nivel de logs de tu paquete base         │
+# │ LOG_FILE_PATH               │ Ruta del archivo de logs                 │
+# │                             │                                          │
+# │ MAIL_HOST                   │ Servidor SMTP                            │
+# │ MAIL_USER                   │ Correo de envío                          │
+# │ MAIL_PASSWORD               │ Contraseña o App Password del correo     │
+# │                             │                                          │
+# │ ACTUATOR_PORT               │ Puerto del Actuator (ej: 8081)           │
+# │ PROMETHEUS_ENABLED          │ true para exportar métricas              │
+# │ TRACING_ENABLED             │ true para tracing distribuido            │
+# └─────────────────────────────┴──────────────────────────────────────────┘
